@@ -78,7 +78,14 @@ fn matchRoute(ctx: *Context, comptime method: std.http.Method, comptime pattern:
 
             inline for (mid..args.len) |i| {
                 const V = @TypeOf(args[i]);
-                args[i] = try if (comptime @typeInfo(V) == .Struct) ctx.req.readJson(V) else params.get(i - mid, V);
+                args[i] = blk: {
+                    if (comptime @typeInfo(V) == .Void) {
+                        break :blk ({});
+                    } else if (comptime @typeInfo(V) == .Struct) {
+                        break :blk ctx.req.readJson(V);
+                    }
+                    break :blk try params.get(i - mid, V);
+                };
             }
 
             try ctx.res.send(@call(.auto, handler, args));
