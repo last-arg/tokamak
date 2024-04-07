@@ -23,7 +23,10 @@ pub const Context = struct {
     drained: bool = false,
 
     fn init(self: *Context, allocator: std.mem.Allocator, server: *Server, http: *std.http.Server) !void {
-        const raw = try http.receiveHead();
+        const raw = http.receiveHead() catch |e| {
+            if (e == error.HttpHeadersUnreadable) return error.HttpConnectionClosing;
+            return e;
+        };
 
         self.* = .{
             .allocator = allocator,
@@ -34,7 +37,7 @@ pub const Context = struct {
 
         self.res.keep_alive = server.keep_alive;
 
-        try self.injector.push(&self.allocator);
+        try self.injector.push(&allocator);
         try self.injector.push(&self.req);
         try self.injector.push(&self.res);
         try self.injector.push(self);
@@ -94,6 +97,14 @@ pub const Server = struct {
     stopped: std.Thread.ResetEvent = .{},
     handler: *const Handler,
     keep_alive: bool,
+
+    /// Run the server, blocking the current thread.
+    pub fn run(allocator: std.mem.Allocator, handler: anytype, options: Options) !void {
+        var server = try start(allocator, handler, options);
+        defer server.deinit();
+
+        server.wait();
+    }
 
     /// Start a new server.
     pub fn start(allocator: std.mem.Allocator, handler: anytype, options: Options) !*Server {
@@ -161,12 +172,12 @@ pub const Server = struct {
             std.debug.panic("accept: {}", .{e});
         };
 
-        const timeout = std.os.timeval{
+        const timeout = std.posix.timeval{
             .tv_sec = @as(i32, 5),
             .tv_usec = @as(i32, 0),
         };
 
-        std.os.setsockopt(conn.stream.handle, std.os.SOL.SOCKET, std.os.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        std.posix.setsockopt(conn.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 
         return conn;
     }
@@ -186,17 +197,20 @@ pub const Server = struct {
 
                 var ctx: Context = undefined;
                 ctx.init(arena.allocator(), server, &http) catch |e| {
-                    log.err("context: {}", .{e});
+                    if (e != error.HttpConnectionClosing) log.err("context: {}", .{e});
                     continue :accept;
                 };
 
+                defer {
+                    if (!ctx.res.responded) ctx.res.noContent() catch {};
+                    ctx.res.out.?.end() catch {};
+                }
+
                 server.handler(&ctx) catch |e| {
+                    log.err("handler: {}", .{e});
                     ctx.res.sendError(e) catch {};
                     continue :accept;
                 };
-
-                if (!ctx.res.responded) ctx.res.noContent() catch {};
-                ctx.res.out.?.end() catch {};
             }
         }
     }
